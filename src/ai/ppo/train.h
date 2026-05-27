@@ -1,7 +1,7 @@
 #include "ai/ppo/losses.h"
 #include <torch/torch.h>
 
-#ifdef __linux__
+#if defined(__linux__) && defined(AI_ENABLE_CUDA_GRAPHS)
 #include <ATen/cuda/CUDAEvent.h>
 #include <ATen/cuda/CUDAGraph.h>
 #include <c10/cuda/CUDAStream.h>
@@ -156,7 +156,7 @@ void train(Network &network, torch::optim::Optimizer &optimizer,
   }
 }
 
-#ifdef __linux__
+#if defined(__linux__) && defined(AI_ENABLE_CUDA_GRAPHS)
 void stream_sync(at::cuda::CUDAStream &dependency,
                  at::cuda::CUDAStream &dependent);
 

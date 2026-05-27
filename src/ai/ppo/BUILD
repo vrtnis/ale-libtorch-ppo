@@ -28,8 +28,5 @@ cc_library(
     deps = [
         ":losses",
         "@libtorch//:torch",
-    ] + select({
-        "@platforms//os:linux": ["@cuda//:cuda_headers"],
-        "//conditions:default": [],
-    }),
+    ],
 )

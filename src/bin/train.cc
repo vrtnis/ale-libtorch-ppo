@@ -5,8 +5,10 @@
 #include "tensorboard_logger.h"
 #include <ale/ale_interface.hpp>
 #include <ale/version.hpp>
+#include <iomanip>
 #include <iostream>
 #include <numeric>
+#include <sstream>
 #include <torch/nn.h>
 #include <torch/torch.h>
 #include <yaml-cpp/yaml.h>
@@ -60,6 +62,9 @@ struct Config {
   bool record_video;
   bool cuda_graph;
   bool deterministic;
+  std::filesystem::path checkpoint_dir;
+  size_t checkpoint_every;
+  std::filesystem::path resume_checkpoint;
 };
 
 google::protobuf::Value get_value(double value) {
@@ -102,6 +107,7 @@ get_parameters(const Config &config) {
   hparams["record_video"] = get_bool_value(config.record_video);
   hparams["cuda_graph"] = get_bool_value(config.cuda_graph);
   hparams["deterministic"] = get_bool_value(config.deterministic);
+  hparams["checkpoint_every"] = get_value(config.checkpoint_every);
   return hparams;
 }
 
@@ -132,8 +138,51 @@ Config load_config(const std::filesystem::path &path) {
   config.record_video = node["record_video"].as<bool>(false);
   config.cuda_graph = node["cuda_graph"].as<bool>(false);
   config.deterministic = node["deterministic"].as<bool>(false);
+  config.checkpoint_dir = node["checkpoint_dir"].as<std::string>("");
+  config.checkpoint_every = node["checkpoint_every"].as<size_t>(0);
+  config.resume_checkpoint = node["resume_checkpoint"].as<std::string>("");
   return config;
 }
+
+bool checkpoint_enabled(const Config &config) {
+  return !config.checkpoint_dir.empty() && config.checkpoint_every > 0;
+}
+
+torch::Tensor scalar_int64(int64_t value) {
+  return torch::tensor(value, torch::TensorOptions().dtype(torch::kInt64));
+}
+
+torch::Tensor scalar_float64(double value) {
+  return torch::tensor(value, torch::TensorOptions().dtype(torch::kFloat64));
+}
+
+int64_t read_int64(torch::serialize::InputArchive &archive,
+                   const std::string &key) {
+  torch::Tensor value;
+  archive.read(key, value, true);
+  return value.item<int64_t>();
+}
+
+double read_float64(torch::serialize::InputArchive &archive,
+                    const std::string &key) {
+  torch::Tensor value;
+  archive.read(key, value, true);
+  return value.item<double>();
+}
+
+std::filesystem::path checkpoint_path(const std::filesystem::path &dir,
+                                      size_t next_rollout_index) {
+  std::ostringstream filename;
+  filename << "checkpoint_rollout_" << std::setw(8) << std::setfill('0')
+           << next_rollout_index << ".pt";
+  return dir / filename.str();
+}
+
+struct CheckpointState {
+  size_t next_rollout_index;
+  double return_sum;
+  double return_count;
+};
 
 template <typename T> float mean(const std::vector<T> &values) {
   if (values.empty())
@@ -269,6 +318,88 @@ struct NetworkImpl : torch::nn::Module {
 };
 TORCH_MODULE(Network);
 
+template <typename Optimizer>
+void save_checkpoint(const std::filesystem::path &path, Network &network,
+                     Optimizer &optimizer, const Config &config,
+                     size_t next_rollout_index) {
+  if (!std::filesystem::exists(path.parent_path())) {
+    std::filesystem::create_directories(path.parent_path());
+  }
+
+  torch::serialize::OutputArchive archive;
+  torch::serialize::OutputArchive model_archive;
+  torch::serialize::OutputArchive optimizer_archive;
+
+  network->save(model_archive);
+  optimizer.save(optimizer_archive);
+
+  archive.write("checkpoint_version", scalar_int64(1), true);
+  archive.write("next_rollout_index",
+                scalar_int64(static_cast<int64_t>(next_rollout_index)), true);
+  archive.write("num_rollouts",
+                scalar_int64(static_cast<int64_t>(config.num_rollouts)), true);
+  archive.write("hidden_size",
+                scalar_int64(static_cast<int64_t>(config.hidden_size)), true);
+  archive.write("action_size",
+                scalar_int64(static_cast<int64_t>(config.action_size)), true);
+  archive.write("frame_stack",
+                scalar_int64(static_cast<int64_t>(config.frame_stack)), true);
+  archive.write("return_sum", scalar_float64(sum), true);
+  archive.write("return_count", scalar_float64(count), true);
+  archive.write("model", model_archive);
+  archive.write("optimizer", optimizer_archive);
+
+  const auto temporary_path = path.string() + ".tmp";
+  archive.save_to(temporary_path);
+  if (std::filesystem::exists(path)) {
+    std::filesystem::remove(path);
+  }
+  std::filesystem::rename(temporary_path, path);
+}
+
+template <typename Optimizer>
+CheckpointState load_checkpoint(const std::filesystem::path &path,
+                                Network &network, Optimizer &optimizer,
+                                const Config &config,
+                                const torch::Device &device) {
+  if (!std::filesystem::exists(path)) {
+    throw std::invalid_argument("Checkpoint file does not exist: " +
+                                path.string());
+  }
+
+  torch::serialize::InputArchive archive;
+  archive.load_from(path.string(), device);
+
+  const auto version = read_int64(archive, "checkpoint_version");
+  if (version != 1) {
+    throw std::runtime_error("Unsupported checkpoint version: " +
+                             std::to_string(version));
+  }
+
+  const auto hidden_size = read_int64(archive, "hidden_size");
+  const auto action_size = read_int64(archive, "action_size");
+  const auto frame_stack = read_int64(archive, "frame_stack");
+  if (hidden_size != static_cast<int64_t>(config.hidden_size) ||
+      action_size != static_cast<int64_t>(config.action_size) ||
+      frame_stack != static_cast<int64_t>(config.frame_stack)) {
+    throw std::runtime_error(
+        "Checkpoint architecture does not match the loaded config.");
+  }
+
+  torch::serialize::InputArchive model_archive;
+  torch::serialize::InputArchive optimizer_archive;
+  archive.read("model", model_archive);
+  archive.read("optimizer", optimizer_archive);
+  network->load(model_archive);
+  network->to(device);
+  optimizer.load(optimizer_archive);
+
+  return {.next_rollout_index =
+              static_cast<size_t>(read_int64(archive, "next_rollout_index")),
+          .return_sum = read_float64(archive, "return_sum"),
+          .return_count = read_float64(archive, "return_count")};
+}
+
 ai::ppo::train::Batch prepare_batch(ai::buffer::Batch &batch) {
   auto observations = batch.observations.flatten(0, 1);
   auto actions = batch.actions.ravel();
@@ -350,6 +481,10 @@ int main(int argc, char **argv) {
   if (video_path.has_value() && !std::filesystem::exists(video_path.value())) {
     std::filesystem::create_directories(video_path.value());
   }
+  if (checkpoint_enabled(config) &&
+      !std::filesystem::exists(config.checkpoint_dir)) {
+    std::filesystem::create_directories(config.checkpoint_dir);
+  }
 
   if (config.deterministic)
     enable_torch_determinism(42);
@@ -360,6 +495,25 @@ int main(int argc, char **argv) {
   torch::optim::Adam optimizer(
       network->parameters(),
       torch::optim::AdamOptions(config.learning_rate).eps(1e-5));
+
+  size_t start_rollout_index = 0;
+  if (!config.resume_checkpoint.empty()) {
+    const auto checkpoint_state =
+        load_checkpoint(config.resume_checkpoint, network, optimizer, config,
+                        device);
+    start_rollout_index = checkpoint_state.next_rollout_index;
+    sum = checkpoint_state.return_sum;
+    count = checkpoint_state.return_count;
+    std::cout << "Resumed checkpoint " << config.resume_checkpoint
+              << " at rollout " << start_rollout_index << std::endl;
+    if (start_rollout_index >= config.num_rollouts) {
+      std::cout << "Checkpoint has already reached the configured rollout "
+                   "count."
+                << std::endl;
+      std::cout << "Success" << std::endl;
+      return 0;
+    }
+  }
 
   ai::rollout::Rollout rollout(
       rom_path, config.total_environments, config.horizon, config.max_steps,
@@ -396,7 +550,7 @@ int main(int argc, char **argv) {
   ai::ppo::train::Batch batch = prepare_batch(b);
   ai::rollout::RolloutResult result;
 
-#ifdef __linux__
+#if defined(__linux__) && defined(AI_ENABLE_CUDA_GRAPHS)
   at::cuda::CUDAGraph graph;
   network->train();
   if (config.cuda_graph) {
@@ -417,8 +571,8 @@ int main(int argc, char **argv) {
         profiler_config, activities,
         {torch::RecordScope::FUNCTION, torch::RecordScope::USER_SCOPE});
   }
-  for (size_t rollout_index = 0; rollout_index < config.num_rollouts;
-       ++rollout_index) {
+  for (size_t rollout_index = start_rollout_index;
+       rollout_index < config.num_rollouts; ++rollout_index) {
     std::cout << "Rollout " << rollout_index + 1 << " of "
               << config.num_rollouts << std::endl;
     auto lr = config.learning_rate *
@@ -432,13 +586,14 @@ int main(int argc, char **argv) {
       result = rollout.rollout();
     }
     if (config.cuda_graph) {
-#ifdef __linux__
+#if defined(__linux__) && defined(AI_ENABLE_CUDA_GRAPHS)
       auto b = prepare_batch(result.batch);
       batch.copy_(b);
       ai::ppo::train::train_cuda_graph(graph);
 #else
-      TORCH_CHECK(false, "cuda_graph is only supported on Linux (__linux__ not "
-                         "defined). Set cuda_graph=false or run on Linux.");
+      TORCH_CHECK(false, "cuda_graph support was not enabled for this build. "
+                         "Set cuda_graph=false or compile with "
+                         "AI_ENABLE_CUDA_GRAPHS and CUDA toolkit headers.");
 #endif
 
     } else {
@@ -455,6 +610,21 @@ int main(int argc, char **argv) {
     sum += std::accumulate(result.log.episode_returns.begin(),
                            result.log.episode_returns.end(), 0.0f);
     count += result.log.episode_returns.size();
+
+    const auto next_rollout_index = rollout_index + 1;
+    if (checkpoint_enabled(config) &&
+        (next_rollout_index % config.checkpoint_every == 0 ||
+         next_rollout_index == config.num_rollouts)) {
+      const auto numbered_path =
+          checkpoint_path(config.checkpoint_dir, next_rollout_index);
+      const auto latest_path = config.checkpoint_dir / "latest.pt";
+      save_checkpoint(numbered_path, network, optimizer, config,
+                      next_rollout_index);
+      std::filesystem::copy_file(
+          numbered_path, latest_path,
+          std::filesystem::copy_options::overwrite_existing);
+      std::cout << "Saved checkpoint " << numbered_path << std::endl;
+    }
   }
   if (!profile_path.empty()) {
     auto profiler_result = torch::autograd::profiler::disableProfiler();

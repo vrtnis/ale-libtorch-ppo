@@ -38,6 +38,38 @@ To run the project, follow these steps:
    4. Specify the group name used for logging parameters to TensorBoard.
    5. Specify the path to the YAML file containing the config to use for running the application.
    6. Optional: specify the location to write a libtorch profile to which can be examined using Perfetto.
+
+## Checkpointing
+
+Checkpointing is configured in the YAML config file. By default it is disabled:
+
+```yaml
+checkpoint_dir: ""
+checkpoint_every: 0
+resume_checkpoint: ""
+```
+
+To save checkpoints every 100 rollouts, set:
+
+```yaml
+checkpoint_dir: "checkpoints/train"
+checkpoint_every: 100
+resume_checkpoint: ""
+```
+
+The trainer writes numbered checkpoints such as
+`checkpoint_rollout_00000100.pt` and also updates `latest.pt` in the same
+directory. To resume training, point `resume_checkpoint` at a saved file:
+
+```yaml
+checkpoint_dir: "checkpoints/train"
+checkpoint_every: 100
+resume_checkpoint: "checkpoints/train/latest.pt"
+```
+
+Checkpoints include the model, optimizer state, next rollout index, and basic
+architecture metadata. They do not include live ALE emulator state, so resumed
+runs restore training state but create fresh emulator instances.
   
 ## Results
 Evaluated using the following hardware:

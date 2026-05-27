@@ -24,3 +24,6 @@ record_observation: false
 record_video: true
 cuda_graph: false
 deterministic: true
+checkpoint_dir: ""
+checkpoint_every: 0
+resume_checkpoint: ""

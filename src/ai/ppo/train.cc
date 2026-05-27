@@ -1,7 +1,7 @@
 #include "ai/ppo/train.h"
 #include <torch/torch.h>
 
-#ifdef __linux__
+#if defined(__linux__) && defined(AI_ENABLE_CUDA_GRAPHS)
 #include <ATen/cuda/CUDAEvent.h>
 #include <ATen/cuda/CUDAGraph.h>
 #include <c10/cuda/CUDAStream.h>
@@ -45,7 +45,7 @@ torch::Tensor clip_grad_norm_(const std::vector<torch::Tensor> &parameters,
   return total_norm_tensor;
 }
 
-#ifdef __linux__
+#if defined(__linux__) && defined(AI_ENABLE_CUDA_GRAPHS)
 void stream_sync(at::cuda::CUDAStream &dependency,
                  at::cuda::CUDAStream &dependent) {
   at::cuda::CUDAEvent cuda_ev;

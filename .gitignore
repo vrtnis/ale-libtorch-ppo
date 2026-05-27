@@ -2,5 +2,6 @@ roms
 bazel-*
 logs
 videos
+checkpoints
 images
 *.mp4
