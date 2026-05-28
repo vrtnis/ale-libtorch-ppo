@@ -39,6 +39,14 @@ To run the project, follow these steps:
    5. Specify the path to the YAML file containing the config to use for running the application.
    6. Optional: specify the location to write a libtorch profile to which can be examined using Perfetto.
 
+6. Evaluate a checkpoint and write gameplay videos without training:
+   ```shell
+   bazel run //src/bin:train --compilation_mode=opt -- eval $(pwd)/roms/breakout.bin $(pwd)/checkpoints/train/latest.pt $(pwd)/videos/eval $(pwd)/configs/v0.yaml 3
+   ```
+   The eval mode loads the checkpoint, runs deterministic greedy-policy games,
+   and writes `episode_1.mp4`, `episode_2.mp4`, etc. to the video directory.
+   The final argument is optional and defaults to 3 episodes.
+
 ## Checkpointing
 
 Checkpointing is configured in the YAML config file. By default it is disabled:

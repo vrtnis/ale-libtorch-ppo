@@ -1,16 +1,31 @@
 #include "ai/ppo/train.h"
+#include "ai/environment/environment.h"
+#include "ai/environment/episode_life.h"
+#include "ai/environment/episode_observation_recorder.h"
+#include "ai/environment/episode_recorder.h"
+#include "ai/environment/fire_reset.h"
+#include "ai/environment/max_and_skip.h"
+#include "ai/environment/noop_reset.h"
+#include "ai/environment/resize.h"
+#include "ai/environment/truncate_on_episode_return.h"
 #include "ai/ppo/losses.h"
 #include "ai/rollout.h"
 #include "ai/vision.h"
 #include "tensorboard_logger.h"
 #include <ale/ale_interface.hpp>
 #include <ale/version.hpp>
+#include <algorithm>
+#include <cstdlib>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <numeric>
 #include <sstream>
+#include <string>
 #include <torch/nn.h>
 #include <torch/torch.h>
+#include <vector>
 #include <yaml-cpp/yaml.h>
 
 const bool ANNEAL_ENTROPY_COEFFICIENT = false;
@@ -448,7 +463,210 @@ void enable_torch_determinism(uint64_t seed) {
   torch::globalContext().setDeterministicFillUninitializedMemory(true);
 }
 
-int main(int argc, char **argv) {
+void print_usage(const char *executable) {
+  std::cerr << "Usage:\n"
+            << "  " << executable
+            << " <rom_path> <logger_path> <video_path> <group_name>"
+               " <config_path> [profile_path]\n"
+            << "  " << executable
+            << " eval <rom_path> <checkpoint_path> <video_path>"
+               " <config_path> [episodes]\n";
+}
+
+torch::Device select_device(const std::string &operation) {
+  torch::Device device(torch::kCPU);
+  if (torch::cuda::is_available()) {
+    std::cout << "CUDA is available! " << operation << " on GPU."
+              << std::endl;
+    device = torch::Device(torch::kCUDA);
+  } else {
+    std::cout << "CUDA is not available! " << operation << " on CPU."
+              << std::endl;
+  }
+#ifdef __APPLE__
+  std::cout << "Using MPS backend on macOS." << std::endl;
+  device = torch::Device(torch::kMPS);
+#endif
+  return device;
+}
+
+std::unique_ptr<ai::environment::VirtualEnvironment> create_eval_environment(
+    const std::filesystem::path &rom_path, const Config &config,
+    const std::filesystem::path &video_path, size_t seed) {
+  std::unique_ptr<ai::environment::VirtualEnvironment> environment =
+      std::make_unique<ai::environment::Environment>(
+          rom_path, config.max_steps, true, static_cast<int>(seed));
+
+  if (config.max_return > 0.0f) {
+    environment =
+        std::make_unique<ai::environment::TruncateOnEpisodeReturnEnvironment>(
+            std::move(environment), config.max_return);
+  }
+
+  environment = std::make_unique<ai::environment::ResizeEnvironment>(
+      std::move(environment), 84, 84);
+
+  if (config.record_observation) {
+    environment =
+        std::make_unique<ai::environment::EpisodeObservationRecorder>(
+            std::move(environment), video_path, 1, 84, 84);
+  } else {
+    environment = std::make_unique<ai::environment::EpisodeRecorder>(
+        std::move(environment), video_path, false);
+  }
+
+  environment = std::make_unique<ai::environment::NoopResetEnvironment>(
+      std::move(environment), 30, seed);
+  environment = std::make_unique<ai::environment::MaxAndSkipEnvironment>(
+      std::move(environment), config.frame_skip);
+  environment =
+      std::make_unique<ai::environment::EpisodeLife>(std::move(environment));
+  environment =
+      std::make_unique<ai::environment::FireReset>(std::move(environment));
+  return environment;
+}
+
+void reset_frame_stack(
+    std::vector<ai::environment::ScreenBuffer> &frame_stack,
+    const ai::environment::ScreenBuffer &observation) {
+  std::fill(frame_stack.begin(), frame_stack.end(), observation);
+}
+
+void push_frame(std::vector<ai::environment::ScreenBuffer> &frame_stack,
+                const ai::environment::ScreenBuffer &observation) {
+  if (frame_stack.empty()) {
+    throw std::runtime_error("Frame stack must not be empty.");
+  }
+  for (size_t frame_index = frame_stack.size() - 1; frame_index > 0;
+       --frame_index) {
+    frame_stack[frame_index] = frame_stack[frame_index - 1];
+  }
+  frame_stack[0] = observation;
+}
+
+torch::Tensor make_eval_observation_tensor(
+    const std::vector<ai::environment::ScreenBuffer> &frame_stack,
+    const torch::Device &device) {
+  if (frame_stack.empty()) {
+    throw std::runtime_error("Frame stack must not be empty.");
+  }
+
+  std::vector<torch::Tensor> frame_tensors;
+  frame_tensors.reserve(frame_stack.size());
+  for (const auto &frame : frame_stack) {
+    if (frame.size() != 84 * 84) {
+      throw std::runtime_error("Unexpected eval frame size.");
+    }
+    frame_tensors.push_back(
+        torch::from_blob(const_cast<unsigned char *>(frame.data()), {84, 84},
+                         torch::TensorOptions().dtype(torch::kByte))
+            .clone());
+  }
+  return torch::stack(frame_tensors, 0).unsqueeze(0).to(device);
+}
+
+int run_eval(int argc, char **argv) {
+  if (argc != 6 && argc != 7) {
+    print_usage(argv[0]);
+    return 1;
+  }
+
+  const auto rom_path = std::filesystem::path(argv[2]);
+  const auto checkpoint_path = std::filesystem::path(argv[3]);
+  const auto video_path = std::filesystem::path(argv[4]);
+  const auto config = load_config(std::filesystem::path(argv[5]));
+  size_t episodes = 3;
+  if (argc == 7) {
+    episodes = static_cast<size_t>(std::stoull(argv[6]));
+  }
+  if (episodes == 0) {
+    throw std::invalid_argument("Eval episodes must be greater than 0.");
+  }
+  if (config.frame_stack == 0) {
+    throw std::invalid_argument("Frame stack must be greater than 0.");
+  }
+
+  if (!std::filesystem::exists(video_path)) {
+    std::filesystem::create_directories(video_path);
+  }
+
+  if (config.deterministic) {
+    enable_torch_determinism(42);
+  }
+
+  torch::Device device = select_device("Evaluating");
+  Network network(config.hidden_size, config.action_size);
+  network->to(device);
+  torch::optim::Adam optimizer(
+      network->parameters(),
+      torch::optim::AdamOptions(config.learning_rate).eps(1e-5));
+
+  const auto checkpoint_state =
+      load_checkpoint(checkpoint_path, network, optimizer, config, device);
+  network->eval();
+
+  auto environment = create_eval_environment(rom_path, config, video_path, 0);
+  const auto action_set = environment->get_interface().getMinimalActionSet();
+  if (action_set.size() != config.action_size) {
+    throw std::runtime_error(
+        "Config action size does not match the ALE minimal action set.");
+  }
+
+  std::cout << "Loaded checkpoint " << checkpoint_path << " at rollout "
+            << checkpoint_state.next_rollout_index << std::endl;
+  std::cout << "Recording " << episodes
+            << " deterministic eval episode(s) to " << video_path
+            << std::endl;
+
+  std::vector<ai::environment::ScreenBuffer> frame_stack(config.frame_stack);
+  for (size_t episode_index = 0; episode_index < episodes; ++episode_index) {
+    auto observation = environment->reset();
+    reset_frame_stack(frame_stack, observation);
+
+    float episode_return = 0.0f;
+    size_t episode_steps = 0;
+    while (true) {
+      torch::NoGradGuard no_grad;
+      const auto observation_tensor =
+          make_eval_observation_tensor(frame_stack, device);
+      const auto output = network->forward(observation_tensor);
+      const auto action_index = output.logits.argmax(-1).item<int64_t>();
+      if (action_index < 0 ||
+          action_index >= static_cast<int64_t>(action_set.size())) {
+        throw std::out_of_range("Policy selected an invalid action index.");
+      }
+
+      const auto step =
+          environment->step(action_set[static_cast<size_t>(action_index)]);
+      episode_return += step.reward;
+      episode_steps++;
+
+      if (step.game_over) {
+        break;
+      }
+
+      if (step.terminated || step.truncated) {
+        observation = environment->reset();
+        reset_frame_stack(frame_stack, observation);
+      } else {
+        push_frame(frame_stack, step.observation);
+      }
+    }
+
+    std::cout << "Eval episode " << episode_index + 1 << " return "
+              << episode_return << " length " << episode_steps << std::endl;
+  }
+
+  std::cout << "Success" << std::endl;
+  return 0;
+}
+
+int run_train(int argc, char **argv) {
+  if (argc != 6 && argc != 7) {
+    print_usage(argv[0]);
+    return 1;
+  }
+
   const auto start_time =
       std::chrono::system_clock::now().time_since_epoch().count();
   const auto rom_path = std::filesystem::path(argv[1]);
@@ -464,16 +682,7 @@ int main(int argc, char **argv) {
   if (argc == 7) {
     profile_path = std::filesystem::path(argv[6]);
   }
-  torch::Device device(torch::kCPU);
-  if (torch::cuda::is_available()) {
-    std::cout << "CUDA is available! Training on GPU." << std::endl;
-    device = torch::Device(torch::kCUDA);
-  } else {
-    std::cout << "CUDA is not available! Training on CPU." << std::endl;
-  }
-#ifdef __APPLE__
-  device = torch::Device(torch::kMPS);
-#endif
+  torch::Device device = select_device("Training");
 
   if (!std::filesystem::exists(logger_path.parent_path())) {
     std::filesystem::create_directories(logger_path.parent_path());
@@ -632,4 +841,11 @@ int main(int argc, char **argv) {
   }
   std::cout << "Success" << std::endl;
   return 0;
+}
+
+int main(int argc, char **argv) {
+  if (argc > 1 && std::string(argv[1]) == "eval") {
+    return run_eval(argc, argv);
+  }
+  return run_train(argc, argv);
 }
