@@ -5,3 +5,6 @@ videos
 checkpoints
 images
 *.mp4
+!docs/
+!docs/assets/
+!docs/assets/view_smoke.mp4

@@ -1,73 +1,98 @@
 # ALE-libtorch-PPO
 
-<p align="center"><a href="https://youtu.be/MQsjzNbIrsQ"><img src="https://github.com/user-attachments/assets/f8b027b6-2294-4142-8fad-549f830d48a3" width="400"></a></p>
+A small C++ PPO trainer for Atari Breakout, based on the original
+`ALE-libtorch-PPO` project by `cemlyn007`.
 
-This project is a C++ application designed to train an agent to master Atari games, with a specific focus on the classic game "Breakout". It leverages reinforcement learning, implementing the Proximal Policy Optimisation (PPO) algorithm to enable the agent to learn and improve its gameplay through trial and error. Multi-threading is used to achieve greater throughput for interacting with the game environment in parallel.
+It uses LibTorch for the neural network, Arcade Learning Environment for Atari,
+Bazel for builds, and FFmpeg for MP4 output. It talks to ALE directly rather
+than going through Gymnasium.
 
-Built using Bazel, this project integrates `libtorch` (the C++ frontend for PyTorch) for its neural network components and the Arcade Learning Environment (ALE) to interface with the Atari games. This combination provides a high-performance environment for cutting-edge AI research.
+You can train from scratch, save checkpoints, resume training, record clean
+eval videos, and render annotated videos with policy/value graphs.
 
-While Python-based libraries dominate the open-source RL scene by offering ease of use and a vast ecosystem, `ALE-libtorch-PPO` contributes a high-performance, C++-native alternative. It is designed for developers and researchers who need high performance, a clean C++ integration path, and a transparent, focused implementation of a strong & popular RL algorithm.
+## Original Project
 
-## Run Instructions
-To run the project, follow these steps:
+This repo is based on the original `ALE-libtorch-PPO` project by `cemlyn007`:
 
-1. Install Bazel by following the [Bazel installation guide](https://bazel.build/install) for your operating system.
+https://github.com/cemlyn007/ALE-libtorch-PPO
 
-2. Install FFmpeg which the environment video recorder uses to generate MP4s of the agent playing the game.
+The original project provided the C++/LibTorch PPO implementation, ALE
+environment integration, Bazel build, and Breakout training setup. This version
+builds on that work with checkpointing, checkpoint eval, annotated view videos,
+run scripts, and documentation updates.
 
-3. Clone the repository:
-   ```shell
-   git clone https://github.com/cemlyn007/ALE-libtorch-PPO.git
-   cd ALE-libtorch-PPO
-   ```
+## Sample Output
 
-4. Download the ROMs:
-   ```shell
-   mkdir roms
-   ./scripts/download_unpack_roms.sh
-   ```
+This is a tiny smoke-test video from the annotated view mode. It is useful for
+checking that rendering works; it is not meant to represent a trained agent.
 
-5. Train the agent using Bazel:
-   ```shell
-   bazel run //src/bin:train --compilation_mode=opt -- $(pwd)/roms/breakout.bin $(pwd)/logs/train $(pwd)/videos/train train $(pwd)/configs/v0.yaml
-   ```
-   Or alternatively, with VS Code, you can run the tasks. The command line arguments do the following:
-   1. Specify which ROM to use.
-   2. Specify the directory to write TensorBoard logs to.
-   3. Specify the directory to write videos to.
-   4. Specify the group name used for logging parameters to TensorBoard.
-   5. Specify the path to the YAML file containing the config to use for running the application.
-   6. Optional: specify the location to write a libtorch profile to which can be examined using Perfetto.
+[Watch the annotated smoke video](docs/assets/view_smoke.mp4)
 
-6. Evaluate a checkpoint and write gameplay videos without training:
-   ```shell
-   bazel run //src/bin:train --compilation_mode=opt -- eval $(pwd)/roms/breakout.bin $(pwd)/checkpoints/train/latest.pt $(pwd)/videos/eval $(pwd)/configs/v0.yaml 3
-   ```
-   The eval mode loads the checkpoint, runs deterministic greedy-policy games,
-   and writes `episode_1.mp4`, `episode_2.mp4`, etc. to the video directory.
-   The final argument is optional and defaults to 3 episodes.
+## Setup
 
-7. Render annotated checkpoint videos with policy/value graphs:
-   ```shell
-   bazel run //src/bin:train --compilation_mode=opt -- view $(pwd)/roms/breakout.bin $(pwd)/checkpoints/train/latest.pt $(pwd)/videos/view $(pwd)/configs/v0.yaml 3
-   ```
-   View mode writes the same episode files, but each frame includes a side
-   panel with the critic state value `V(s)`, policy probabilities for the
-   available actions, selected action, step count, and episode return. Since
-   this is a PPO actor-critic model, the action bars show policy probabilities
-   rather than Q-values.
+Install:
 
-## Checkpointing
+- Bazel or Bazelisk
+- FFmpeg
+- A Breakout ROM
 
-Checkpointing is configured in the YAML config file. By default it is disabled:
+The ROM is not included. Put it here:
 
-```yaml
-checkpoint_dir: ""
-checkpoint_every: 0
-resume_checkpoint: ""
+```shell
+mkdir -p roms
+cp /path/to/breakout.bin roms/breakout.bin
 ```
 
-To save checkpoints every 100 rollouts, set:
+## Build
+
+```shell
+bazel build --config=opt //src/bin:train
+```
+
+## Quick Smoke Run
+
+This runs a small debug config so you can check that the build, ROM, ALE, and
+FFmpeg are wired up:
+
+```shell
+./scripts/run_debug.sh
+```
+
+The smoke run writes logs and any configured videos under:
+
+```text
+logs/debug/
+videos/debug/
+```
+
+## Train
+
+For the main v0 config:
+
+```shell
+./scripts/train_v0.sh
+```
+
+The script is just a wrapper around:
+
+```shell
+bazel run --config=opt //src/bin:train -- \
+  roms/breakout.bin \
+  logs/train \
+  videos/train \
+  breakout-v0 \
+  configs/v0.yaml
+```
+
+You can override paths without editing the script:
+
+```shell
+ROM_PATH=roms/breakout.bin CONFIG=configs/v1.yaml RUN_NAME=breakout-v1 ./scripts/train_v0.sh
+```
+
+## Checkpoints
+
+Checkpointing is controlled in the YAML config:
 
 ```yaml
 checkpoint_dir: "checkpoints/train"
@@ -75,56 +100,132 @@ checkpoint_every: 100
 resume_checkpoint: ""
 ```
 
-The trainer writes numbered checkpoints such as
-`checkpoint_rollout_00000100.pt` and also updates `latest.pt` in the same
-directory. To resume training, point `resume_checkpoint` at a saved file:
+The trainer writes numbered checkpoints and keeps `latest.pt` updated in the
+same directory.
+
+To resume training, point `resume_checkpoint` at a saved checkpoint:
 
 ```yaml
-checkpoint_dir: "checkpoints/train"
-checkpoint_every: 100
 resume_checkpoint: "checkpoints/train/latest.pt"
 ```
 
-Checkpoints include the model, optimizer state, next rollout index, and basic
-architecture metadata. They do not include live ALE emulator state, so resumed
-runs restore training state but create fresh emulator instances.
-  
-## Results
-Evaluated using the following hardware:
-* ASUS ROG STRIX X670E-F GAMING WIFI
-* AMD Ryzen™ 9 7950X3D × 32
-* NVIDIA GeForce RTX™ 4090
+Checkpoints include the model, optimizer state, next rollout index, return
+tracking state, and basic architecture metadata. They do not include live ALE
+emulator state, so resumed runs restore training state but create fresh emulator
+instances.
 
-### V0 Config
-<p align="center"><img width="400" alt="TensorBoard showing PPO achieving score of 400 on Breakout within 10 million agent steps." src="https://github.com/user-attachments/assets/e1b62320-87e8-4ea9-9dd7-dbed2d0dfe98" /></p>
-Achieved 10 million agent steps in 37 minutes and 39 seconds, using the v0 config, with an average steps per second of ~4426 with video recording enabled as well.
+## Record A Clean Eval Video
 
-### V1 Config
-<p align="center"><img width="400" alt="TensorBoard showing PPO achieving the maximum score on Breakout of 864." src="https://github.com/user-attachments/assets/d1bcec5b-20a2-49f6-ad9a-387f81950cff" /></p>
-Achieved an average of ~26,289 steps per second, with video recording enabled, with hardware still not fully utilised.
+Use eval mode when you want to see the current agent without training:
 
-## Profiling
-There are three views for profiling this application, using `./scripts/flamegraph.sh`, running the application with a 6th command line argument which specifies where to save the Perfetto profile, lastly you can use nsys to profile the application. The flamegraph script will generate a flamegraph of the application, which can be viewed in a web browser. The Perfetto profile can be opened in the Perfetto UI, and NVIDIA Nsight Systems UI can also be used for profiling if you hook up the path to the `train` binary.
+```shell
+./scripts/eval_video.sh
+```
 
-## Contributions Welcome
+The script wraps:
 
-I welcome contributions from the community! If you're interested in improving `ALE-libtorch-PPO`, here are some ways you can help:
+```shell
+bazel run --config=opt //src/bin:train -- \
+  eval \
+  roms/breakout.bin \
+  checkpoints/train/latest.pt \
+  videos/eval \
+  configs/v0.yaml \
+  3
+```
 
-*   **Reporting Bugs:** If you find a bug, please open an issue and provide as much detail as possible.
-*   **Suggesting Enhancements:** Have an idea for a new feature or an improvement to an existing one? I'd love to hear it.
-*   **Code Contributions:** If you'd like to contribute code, please fork the repository and submit a pull request. I appreciate all contributions, from small bug fixes to major new features.
+This writes:
 
-I look forward to collaborating with you!
+```text
+videos/eval/episode_1.mp4
+videos/eval/episode_2.mp4
+videos/eval/episode_3.mp4
+```
+
+## Record An Annotated View Video
+
+Use view mode when you want a presentation-style video with graphs on the side:
+
+```shell
+./scripts/view_checkpoint.sh
+```
+
+The script wraps:
+
+```shell
+bazel run --config=opt //src/bin:train -- \
+  view \
+  roms/breakout.bin \
+  checkpoints/train/latest.pt \
+  videos/view \
+  configs/v0.yaml \
+  3
+```
+
+The side panel shows:
+
+- critic value `V(s)`
+- policy probabilities for each action
+- selected action
+- episode return
+- step count
+
+The bars are policy probabilities, not Q-values. This is a PPO actor-critic
+model, so it learns a policy and a state-value function rather than a Q-function.
+
+## Output Locations
+
+Training logs:
+
+```text
+logs/
+```
+
+Recorded videos:
+
+```text
+videos/
+```
+
+Saved checkpoints:
+
+```text
+checkpoints/
+```
+
+The exact checkpoint path comes from `checkpoint_dir` in the YAML config.
+
+## Troubleshooting
+
+If the ROM is missing, put `breakout.bin` under `roms/` or set `ROM_PATH` when
+running a script.
+
+If video recording fails, check that `ffmpeg` is installed and available on
+`PATH`.
+
+If eval or view mode says the checkpoint is missing, train with checkpointing
+enabled first, or set `CHECKPOINT=/path/to/latest.pt`.
+
+If a checkpoint does not load, make sure the config matches the checkpoint. The
+hidden size, action size, and frame stack need to match.
+
+If a full training run feels too slow for iteration, start with
+`./scripts/run_debug.sh` before moving to `configs/v0.yaml` or `configs/v1.yaml`.
+
+## Useful Environment Overrides
+
+The scripts use simple defaults, but you can override them from the shell:
+
+```shell
+ROM_PATH=roms/breakout.bin ./scripts/run_debug.sh
+CHECKPOINT=checkpoints/train/latest.pt EPISODES=1 ./scripts/eval_video.sh
+VIDEO_DIR=videos/view CONFIG=configs/v0.yaml ./scripts/view_checkpoint.sh
+```
 
 ## Acknowledgements
 
-Obviously, the authors of any of the libraries & tools used in this project deserve credit, including but not limited to:
-*   [libtorch](https://pytorch.org/cppdocs/)
-*   [Arcade Learning Environment](https://github.com/Farama-Foundation/Arcade-Learning-Environment)
-*   [Bazel](https://bazel.build/)
-
-Additionally, kudos to Costa Huang who authored [CleanRL](https://github.com/vwxyzjn/cleanrl) which served as a baseline for comparing the results of this project.
-
-## In Memory
-
-This project is dedicated to my late Gran, who always supported my endeavours. I love you, Gran.
+- Original project: https://github.com/cemlyn007/ALE-libtorch-PPO
+- [LibTorch](https://pytorch.org/cppdocs/)
+- [Arcade Learning Environment](https://github.com/Farama-Foundation/Arcade-Learning-Environment)
+- [Bazel](https://bazel.build/)
+- [CleanRL](https://github.com/vwxyzjn/cleanrl), which served as a useful PPO baseline
