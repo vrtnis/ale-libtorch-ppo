@@ -26,7 +26,9 @@ run scripts, and documentation updates.
 This is a tiny smoke-test video from the annotated view mode. It is useful for
 checking that rendering works; it is not meant to represent a trained agent.
 
-[Watch the annotated smoke video](docs/assets/view_smoke.mp4)
+<video src="docs/assets/view_smoke.mp4" controls width="460"></video>
+
+[Open the annotated smoke video](docs/assets/view_smoke.mp4)
 
 ## Setup
 
