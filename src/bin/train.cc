@@ -10,6 +10,8 @@
 #include "ai/environment/truncate_on_episode_return.h"
 #include "ai/ppo/losses.h"
 #include "ai/rollout.h"
+#include "ai/video_recorder.h"
+#include "ai/view_renderer.h"
 #include "ai/vision.h"
 #include "tensorboard_logger.h"
 #include <ale/ale_interface.hpp>
@@ -21,6 +23,7 @@
 #include <iostream>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <torch/nn.h>
@@ -470,6 +473,9 @@ void print_usage(const char *executable) {
                " <config_path> [profile_path]\n"
             << "  " << executable
             << " eval <rom_path> <checkpoint_path> <video_path>"
+               " <config_path> [episodes]\n"
+            << "  " << executable
+            << " view <rom_path> <checkpoint_path> <video_path>"
                " <config_path> [episodes]\n";
 }
 
@@ -490,9 +496,9 @@ torch::Device select_device(const std::string &operation) {
   return device;
 }
 
-std::unique_ptr<ai::environment::VirtualEnvironment> create_eval_environment(
-    const std::filesystem::path &rom_path, const Config &config,
-    const std::filesystem::path &video_path, size_t seed) {
+std::unique_ptr<ai::environment::VirtualEnvironment> create_playback_environment(
+    const std::filesystem::path &rom_path, const Config &config, size_t seed,
+    const std::optional<std::filesystem::path> &video_path) {
   std::unique_ptr<ai::environment::VirtualEnvironment> environment =
       std::make_unique<ai::environment::Environment>(
           rom_path, config.max_steps, true, static_cast<int>(seed));
@@ -506,13 +512,15 @@ std::unique_ptr<ai::environment::VirtualEnvironment> create_eval_environment(
   environment = std::make_unique<ai::environment::ResizeEnvironment>(
       std::move(environment), 84, 84);
 
-  if (config.record_observation) {
-    environment =
-        std::make_unique<ai::environment::EpisodeObservationRecorder>(
-            std::move(environment), video_path, 1, 84, 84);
-  } else {
-    environment = std::make_unique<ai::environment::EpisodeRecorder>(
-        std::move(environment), video_path, false);
+  if (video_path.has_value()) {
+    if (config.record_observation) {
+      environment =
+          std::make_unique<ai::environment::EpisodeObservationRecorder>(
+              std::move(environment), video_path.value(), 1, 84, 84);
+    } else {
+      environment = std::make_unique<ai::environment::EpisodeRecorder>(
+          std::move(environment), video_path.value(), false);
+    }
   }
 
   environment = std::make_unique<ai::environment::NoopResetEnvironment>(
@@ -565,6 +573,53 @@ torch::Tensor make_eval_observation_tensor(
   return torch::stack(frame_tensors, 0).unsqueeze(0).to(device);
 }
 
+struct PolicyTelemetry {
+  int64_t action_index;
+  float value;
+  std::vector<float> action_probabilities;
+};
+
+PolicyTelemetry select_greedy_policy(
+    Network &network,
+    const std::vector<ai::environment::ScreenBuffer> &frame_stack,
+    const torch::Device &device) {
+  torch::NoGradGuard no_grad;
+  const auto observation_tensor =
+      make_eval_observation_tensor(frame_stack, device);
+  const auto output = network->forward(observation_tensor);
+  const auto action_index = output.logits.argmax(-1).item<int64_t>();
+  auto probabilities = torch::nn::functional::softmax(output.logits, -1)
+                           .squeeze(0)
+                           .contiguous()
+                           .to(torch::kCPU, torch::kFloat);
+  const float *data_ptr = probabilities.data_ptr<float>();
+  std::vector<float> action_probabilities(
+      data_ptr, data_ptr + probabilities.numel());
+  return {.action_index = action_index,
+          .value = output.value.item<float>(),
+          .action_probabilities = action_probabilities};
+}
+
+std::vector<std::string> action_labels(size_t action_count) {
+  if (action_count == 4) {
+    return {"NOOP", "FIRE", "RIGHT", "LEFT"};
+  }
+  std::vector<std::string> labels;
+  labels.reserve(action_count);
+  for (size_t i = 0; i < action_count; ++i) {
+    labels.push_back("A" + std::to_string(i));
+  }
+  return labels;
+}
+
+std::vector<unsigned char>
+get_rgb_screen(ai::environment::VirtualEnvironment &environment) {
+  const auto screen = environment.get_interface().getScreen();
+  std::vector<unsigned char> rgb(3 * screen.width() * screen.height());
+  environment.get_interface().getScreenRGB(rgb);
+  return rgb;
+}
+
 int run_eval(int argc, char **argv) {
   if (argc != 6 && argc != 7) {
     print_usage(argv[0]);
@@ -605,7 +660,8 @@ int run_eval(int argc, char **argv) {
       load_checkpoint(checkpoint_path, network, optimizer, config, device);
   network->eval();
 
-  auto environment = create_eval_environment(rom_path, config, video_path, 0);
+  auto environment =
+      create_playback_environment(rom_path, config, 0, video_path);
   const auto action_set = environment->get_interface().getMinimalActionSet();
   if (action_set.size() != config.action_size) {
     throw std::runtime_error(
@@ -626,18 +682,14 @@ int run_eval(int argc, char **argv) {
     float episode_return = 0.0f;
     size_t episode_steps = 0;
     while (true) {
-      torch::NoGradGuard no_grad;
-      const auto observation_tensor =
-          make_eval_observation_tensor(frame_stack, device);
-      const auto output = network->forward(observation_tensor);
-      const auto action_index = output.logits.argmax(-1).item<int64_t>();
-      if (action_index < 0 ||
-          action_index >= static_cast<int64_t>(action_set.size())) {
+      const auto policy = select_greedy_policy(network, frame_stack, device);
+      if (policy.action_index < 0 ||
+          policy.action_index >= static_cast<int64_t>(action_set.size())) {
         throw std::out_of_range("Policy selected an invalid action index.");
       }
 
       const auto step =
-          environment->step(action_set[static_cast<size_t>(action_index)]);
+          environment->step(action_set[static_cast<size_t>(policy.action_index)]);
       episode_return += step.reward;
       episode_steps++;
 
@@ -654,6 +706,125 @@ int run_eval(int argc, char **argv) {
     }
 
     std::cout << "Eval episode " << episode_index + 1 << " return "
+              << episode_return << " length " << episode_steps << std::endl;
+  }
+
+  std::cout << "Success" << std::endl;
+  return 0;
+}
+
+int run_view(int argc, char **argv) {
+  if (argc != 6 && argc != 7) {
+    print_usage(argv[0]);
+    return 1;
+  }
+
+  const auto rom_path = std::filesystem::path(argv[2]);
+  const auto checkpoint_path = std::filesystem::path(argv[3]);
+  const auto video_path = std::filesystem::path(argv[4]);
+  const auto config = load_config(std::filesystem::path(argv[5]));
+  size_t episodes = 3;
+  if (argc == 7) {
+    episodes = static_cast<size_t>(std::stoull(argv[6]));
+  }
+  if (episodes == 0) {
+    throw std::invalid_argument("View episodes must be greater than 0.");
+  }
+  if (config.frame_stack == 0) {
+    throw std::invalid_argument("Frame stack must be greater than 0.");
+  }
+
+  if (!std::filesystem::exists(video_path)) {
+    std::filesystem::create_directories(video_path);
+  }
+
+  if (config.deterministic) {
+    enable_torch_determinism(42);
+  }
+
+  torch::Device device = select_device("Rendering view");
+  Network network(config.hidden_size, config.action_size);
+  network->to(device);
+  torch::optim::Adam optimizer(
+      network->parameters(),
+      torch::optim::AdamOptions(config.learning_rate).eps(1e-5));
+
+  const auto checkpoint_state =
+      load_checkpoint(checkpoint_path, network, optimizer, config, device);
+  network->eval();
+
+  auto environment =
+      create_playback_environment(rom_path, config, 0, std::nullopt);
+  const auto action_set = environment->get_interface().getMinimalActionSet();
+  if (action_set.size() != config.action_size) {
+    throw std::runtime_error(
+        "Config action size does not match the ALE minimal action set.");
+  }
+  const auto labels = action_labels(action_set.size());
+  const auto screen = environment->get_interface().getScreen();
+
+  ai::view_renderer::ViewRenderer renderer(screen.width(), screen.height(),
+                                           300);
+  ai::video_recorder::VideoRecorder recorder(video_path, 3, renderer.width(),
+                                             renderer.height(), 60);
+
+  std::cout << "Loaded checkpoint " << checkpoint_path << " at rollout "
+            << checkpoint_state.next_rollout_index << std::endl;
+  std::cout << "Rendering " << episodes << " annotated view episode(s) to "
+            << video_path << std::endl;
+
+  std::vector<ai::environment::ScreenBuffer> frame_stack(config.frame_stack);
+  for (size_t episode_index = 0; episode_index < episodes; ++episode_index) {
+    renderer.reset();
+    const auto episode_path =
+        std::filesystem::path("episode_" + std::to_string(episode_index + 1) +
+                              ".mp4");
+    recorder.open(episode_path);
+
+    auto observation = environment->reset();
+    reset_frame_stack(frame_stack, observation);
+
+    float episode_return = 0.0f;
+    size_t episode_steps = 0;
+    while (true) {
+      const auto policy = select_greedy_policy(network, frame_stack, device);
+      if (policy.action_index < 0 ||
+          policy.action_index >= static_cast<int64_t>(action_set.size())) {
+        throw std::out_of_range("Policy selected an invalid action index.");
+      }
+
+      const ai::view_renderer::ViewFrame frame{
+          .game_rgb = get_rgb_screen(*environment),
+          .game_width = screen.width(),
+          .game_height = screen.height(),
+          .value = policy.value,
+          .action_probabilities = policy.action_probabilities,
+          .selected_action = static_cast<size_t>(policy.action_index),
+          .action_labels = labels,
+          .episode_return = episode_return,
+          .episode_step = episode_steps};
+      const auto rendered_frame = renderer.render(frame);
+      recorder.write(rendered_frame.data());
+
+      const auto step =
+          environment->step(action_set[static_cast<size_t>(policy.action_index)]);
+      episode_return += step.reward;
+      episode_steps++;
+
+      if (step.game_over) {
+        break;
+      }
+
+      if (step.terminated || step.truncated) {
+        observation = environment->reset();
+        reset_frame_stack(frame_stack, observation);
+      } else {
+        push_frame(frame_stack, step.observation);
+      }
+    }
+
+    recorder.close();
+    std::cout << "View episode " << episode_index + 1 << " return "
               << episode_return << " length " << episode_steps << std::endl;
   }
 
@@ -846,6 +1017,9 @@ int run_train(int argc, char **argv) {
 int main(int argc, char **argv) {
   if (argc > 1 && std::string(argv[1]) == "eval") {
     return run_eval(argc, argv);
+  }
+  if (argc > 1 && std::string(argv[1]) == "view") {
+    return run_view(argc, argv);
   }
   return run_train(argc, argv);
 }

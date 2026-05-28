@@ -47,6 +47,16 @@ To run the project, follow these steps:
    and writes `episode_1.mp4`, `episode_2.mp4`, etc. to the video directory.
    The final argument is optional and defaults to 3 episodes.
 
+7. Render annotated checkpoint videos with policy/value graphs:
+   ```shell
+   bazel run //src/bin:train --compilation_mode=opt -- view $(pwd)/roms/breakout.bin $(pwd)/checkpoints/train/latest.pt $(pwd)/videos/view $(pwd)/configs/v0.yaml 3
+   ```
+   View mode writes the same episode files, but each frame includes a side
+   panel with the critic state value `V(s)`, policy probabilities for the
+   available actions, selected action, step count, and episode return. Since
+   this is a PPO actor-critic model, the action bars show policy probabilities
+   rather than Q-values.
+
 ## Checkpointing
 
 Checkpointing is configured in the YAML config file. By default it is disabled:

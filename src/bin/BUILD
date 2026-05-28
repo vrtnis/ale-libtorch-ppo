@@ -16,6 +16,8 @@ cc_binary(
         "//src/ai/environment:noop_reset",
         "//src/ai/environment:resize",
         "//src/ai/environment:truncate_on_episode_return",
+        "//src/ai:video_recorder",
+        "//src/ai:view_renderer",
         "@arcade_learning_environment//:ale",
         "@libtorch//:torch",
         "@tensorboard_logger",

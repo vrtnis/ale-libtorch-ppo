@@ -53,6 +53,13 @@ cc_library(
 )
 
 cc_library(
+    name = "view_renderer",
+    srcs = ["view_renderer.cc"],
+    hdrs = ["view_renderer.h"],
+    strip_include_prefix = "/src",
+)
+
+cc_library(
     name = "vision",
     srcs = ["vision.cc"],
     hdrs = ["vision.h"],
